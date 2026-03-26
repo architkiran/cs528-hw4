@@ -17,7 +17,6 @@ BUCKET_NAME=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/insta
 FORBIDDEN_URL=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/instance/attributes/forbidden-service-url" -H "Metadata-Flavor: Google")
 DB_HOST=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/instance/attributes/db-host" -H "Metadata-Flavor: Google")
 
-# Write server.py
 cat > /opt/server.py << 'PYEOF'
 #!/usr/bin/env python3
 import http.server
@@ -30,10 +29,11 @@ import urllib.request
 from datetime import datetime
 
 import mysql.connector
+from mysql.connector import pooling
 from google.cloud import storage
 import google.cloud.logging
 
-log_client = google.cloud.logging.Client()
+log_client = google.cloud.logging.Client(project="utopian-planet-485618-b3")
 log_client.setup_logging()
 logger = logging.getLogger(__name__)
 
@@ -50,10 +50,20 @@ FORBIDDEN_COUNTRIES = {
     "iraq", "libya", "sudan", "zimbabwe", "syria"
 }
 
+storage_client = storage.Client(project="utopian-planet-485618-b3")
+bucket = storage_client.bucket(BUCKET_NAME)
+
+db_pool = pooling.MySQLConnectionPool(
+    pool_name="hw5pool",
+    pool_size=10,
+    host=DB_HOST,
+    user=DB_USER,
+    password=DB_PASS,
+    database=DB_NAME
+)
+
 def get_db_connection():
-    return mysql.connector.connect(
-        host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME
-    )
+    return db_pool.get_connection()
 
 def extract_headers(handler):
     t0 = time.perf_counter()
@@ -72,8 +82,6 @@ def extract_headers(handler):
 
 def read_from_gcs(filename):
     t0 = time.perf_counter()
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(BUCKET_NAME)
     blob = bucket.blob(filename)
     exists = blob.exists()
     content = blob.download_as_bytes() if exists else None
@@ -172,7 +180,6 @@ class GCSHandler(http.server.BaseHTTPRequestHandler):
         try:
             content = read_from_gcs(filename)
             if content is None:
-                logger.warning(f"404 Not Found: file={filename}")
                 send_response_to_client(self, 404, f"File not found: {filename}".encode())
                 insert_error(filename, 404)
                 return
@@ -207,7 +214,6 @@ if __name__ == "__main__":
         httpd.serve_forever()
 PYEOF
 
-# Create systemd service
 cat > /etc/systemd/system/webserver.service << SVCEOF
 [Unit]
 Description=HW5 GCS Web Server

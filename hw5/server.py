@@ -9,10 +9,11 @@ import urllib.request
 from datetime import datetime
 
 import mysql.connector
+from mysql.connector import pooling
 from google.cloud import storage
 import google.cloud.logging
 
-log_client = google.cloud.logging.Client()
+log_client = google.cloud.logging.Client(project="utopian-planet-485618-b3")
 log_client.setup_logging()
 logger = logging.getLogger(__name__)
 
@@ -29,15 +30,23 @@ FORBIDDEN_COUNTRIES = {
     "iraq", "libya", "sudan", "zimbabwe", "syria"
 }
 
-def get_db_connection():
-    return mysql.connector.connect(
-        host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME
-    )
+# Global reusable clients
+storage_client = storage.Client(project="utopian-planet-485618-b3")
+bucket = storage_client.bucket(BUCKET_NAME)
 
-# ── Instrumented functions ──────────────────────────────────────────────────
+db_pool = pooling.MySQLConnectionPool(
+    pool_name="hw5pool",
+    pool_size=10,
+    host=DB_HOST,
+    user=DB_USER,
+    password=DB_PASS,
+    database=DB_NAME
+)
+
+def get_db_connection():
+    return db_pool.get_connection()
 
 def extract_headers(handler):
-    """Extract and return all relevant headers from the request."""
     t0 = time.perf_counter()
     data = {
         "country":   handler.headers.get("X-country", "").strip().lower(),
@@ -53,10 +62,7 @@ def extract_headers(handler):
     return data
 
 def read_from_gcs(filename):
-    """Read a file from GCS and return its bytes."""
     t0 = time.perf_counter()
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(BUCKET_NAME)
     blob = bucket.blob(filename)
     exists = blob.exists()
     content = blob.download_as_bytes() if exists else None
@@ -65,7 +71,6 @@ def read_from_gcs(filename):
     return content
 
 def send_response_to_client(handler, code, content=None, content_type="text/html"):
-    """Send HTTP response to client."""
     t0 = time.perf_counter()
     handler.send_response(code)
     if content:
@@ -78,7 +83,6 @@ def send_response_to_client(handler, code, content=None, content_type="text/html
     logger.info(f"[TIMING] send_response: {elapsed:.6f}s")
 
 def insert_request(data):
-    """Insert a successful request into the DB."""
     t0 = time.perf_counter()
     try:
         conn = get_db_connection()
@@ -102,7 +106,6 @@ def insert_request(data):
     logger.info(f"[TIMING] insert_request (DB): {elapsed:.6f}s")
 
 def insert_error(filename, error_code):
-    """Insert a failed request into the errors table."""
     t0 = time.perf_counter()
     try:
         conn = get_db_connection()
@@ -119,15 +122,12 @@ def insert_error(filename, error_code):
     elapsed = time.perf_counter() - t0
     logger.info(f"[TIMING] insert_error (DB): {elapsed:.6f}s")
 
-# ── HTTP Handler ────────────────────────────────────────────────────────────
-
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
 
 class GCSHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
-        # 1. Extract headers
         data = extract_headers(self)
         filename = data["filename"]
 
@@ -136,7 +136,6 @@ class GCSHandler(http.server.BaseHTTPRequestHandler):
             insert_error("", 400)
             return
 
-        # 2. Check forbidden country
         if data["country"] in FORBIDDEN_COUNTRIES:
             logger.critical(f"403 Forbidden: country={data['country']} file={filename}")
             if FORBIDDEN_SERVICE_URL:
@@ -159,21 +158,14 @@ class GCSHandler(http.server.BaseHTTPRequestHandler):
             insert_error(filename, 403)
             return
 
-        # 3. Read from GCS
         try:
             content = read_from_gcs(filename)
             if content is None:
-                logger.warning(f"404 Not Found: file={filename}")
                 send_response_to_client(self, 404, f"File not found: {filename}".encode())
                 insert_error(filename, 404)
                 return
-
-            # 4. Send response
             send_response_to_client(self, 200, content)
-
-            # 5. Log to DB
             insert_request(data)
-
         except Exception as e:
             logger.error(f"500 Internal Error: {e}")
             send_response_to_client(self, 500, b"500 Internal Server Error")
